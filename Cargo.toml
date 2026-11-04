@@ -1,0 +1,29 @@
+[package]
+name = "open-g435-driver"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "Independent clean-room driver for the Logitech G435 LIGHTSPEED USB receiver"
+repository = "https://github.com/emiliano-go/open-g435-driver"
+readme = "README.md"
+
+[lib]
+name = "open_g435"
+path = "src/lib.rs"
+
+[[bin]]
+name = "g435ctl"
+path = "src/bin/g435ctl.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+hidapi = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
