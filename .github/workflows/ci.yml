@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install hidapi build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo clippy --all-targets
+      - name: Test
+        run: cargo test
