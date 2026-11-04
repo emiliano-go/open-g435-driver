@@ -113,6 +113,92 @@ pub struct ImageVersion {
     pub raw: Vec<u8>,
 }
 
+/// Filesystem index entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsIndex {
+    /// Entry offset in external flash.
+    pub offset: u32,
+    /// Entry size in bytes.
+    pub size: u32,
+}
+
+/// LPC query reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lpc {
+    /// Count byte.
+    pub count: u8,
+    /// Eight PLC bytes.
+    pub plc: [u8; 8],
+}
+
+/// Link-quality query reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quality {
+    /// Connection handle.
+    pub conn_handle: u16,
+    /// Count byte.
+    pub count: u8,
+    /// RSSI in dBm.
+    pub rssi: i8,
+    /// Quality byte.
+    pub quality: u8,
+}
+
+/// DEVM query reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Devm {
+    /// Connection handle.
+    pub conn_handle: u16,
+    /// Count byte.
+    pub count: u8,
+    /// Eighty DEVM bytes.
+    pub devm: [u8; 80],
+}
+
+/// AFH map query reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AfhMap {
+    /// Connection handle.
+    pub conn_handle: u16,
+    /// Ten channel bytes.
+    pub channels: [u8; 10],
+}
+
+/// Raw OTA reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawOtaReply {
+    /// OTA status byte.
+    pub status: u8,
+    /// OTA data bytes.
+    pub data: Vec<u8>,
+    /// Raw PI frame bytes.
+    pub frame: Vec<u8>,
+}
+
+/// Raw link reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawLinkReply {
+    /// Link event data bytes.
+    pub data: Vec<u8>,
+    /// Raw PI frame bytes.
+    pub frame: Vec<u8>,
+}
+
+/// Raw PA reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawPaReply {
+    /// Reply category byte.
+    pub category: u8,
+    /// Reply sequence byte.
+    pub seq: u8,
+    /// OTA status when the reply is an OTA reply.
+    pub status: Option<u8>,
+    /// Reply data bytes.
+    pub data: Vec<u8>,
+    /// Raw PI frame bytes.
+    pub frame: Vec<u8>,
+}
+
 impl ImageVersion {
     /// Raw bytes.
     pub fn bytes(&self) -> &[u8] {
@@ -132,7 +218,6 @@ pub struct G435 {
     assembler: FrameAssembler,
     bridge_open: bool,
     bridge_maybe_open: bool,
-    bridge_link_ack: Option<Vec<u8>>,
     reply_timeout: Duration,
     ack_timeout: Duration,
 }
@@ -172,7 +257,6 @@ impl G435 {
             assembler: FrameAssembler::new(),
             bridge_open: false,
             bridge_maybe_open: false,
-            bridge_link_ack: None,
             reply_timeout,
             ack_timeout,
         }
@@ -208,11 +292,32 @@ impl G435 {
         })
     }
 
-    /// Set the link mode.
+    /// Set the link mode and confirm it with `GET_MODE`.
     ///
-    /// The request is written and acknowledged only by draining stale input.
+    /// The setter is fire-and-forget; the new mode is confirmed by reading it
+    /// back in the same bootloader session.
     pub fn set_mode(&mut self, mode: Mode) -> Result<()> {
-        self.send_link(&protocol::link_payload(0xe1, &[mode.bit()]))
+        self.with_bridge(|driver| {
+            driver.send_link_raw(&protocol::link_payload(0xe1, &[mode.bit()]))?;
+            for attempt in 0..=MODE_RETRIES {
+                sleep(MODE_SETTLE);
+                let frame = driver.link_query_raw(&protocol::link_payload(0xe0, &[]))?;
+                let current = if frame.link_byte()? == 1 {
+                    Mode::Remote
+                } else {
+                    Mode::Local
+                };
+                if current == mode {
+                    return Ok(());
+                }
+                if attempt == MODE_RETRIES {
+                    break;
+                }
+            }
+            Err(Error::Protocol(format!(
+                "receiver did not switch to {mode} mode"
+            )))
+        })
     }
 
     /// Enable or disable Bluetooth inquiry scan.
@@ -265,6 +370,196 @@ impl G435 {
     pub fn image_version(&mut self) -> Result<ImageVersion> {
         let raw = self.with_ota_bridge(&protocol::get_image_version_payload())?;
         Ok(ImageVersion { raw })
+    }
+
+    /// Read the 140-byte filesystem table.
+    pub fn fs_table(&mut self) -> Result<Vec<u8>> {
+        self.ota_read(&protocol::fs_table_payload())
+    }
+
+    /// Read one filesystem index entry.
+    pub fn fs_index(&mut self, index: u8) -> Result<FsIndex> {
+        let data = self.ota_read(&protocol::fs_index_payload(index))?;
+        if data.len() < 8 {
+            return Err(Error::Protocol(format!(
+                "filesystem index reply is {} bytes, need at least 8",
+                data.len()
+            )));
+        }
+        Ok(FsIndex {
+            offset: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+            size: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
+        })
+    }
+
+    /// Read customer info by ID.
+    pub fn cust_info(&mut self, id: u8) -> Result<Vec<u8>> {
+        self.ota_read(&protocol::cust_info_payload(id))
+    }
+
+    /// Read MP data by ID.
+    pub fn mp_read(&mut self, id: u8) -> Result<Vec<u8>> {
+        self.ota_read(&protocol::mp_read_payload(id))
+    }
+
+    /// Read NVDS data by ID.
+    pub fn nvds_read(&mut self, id: u8) -> Result<Vec<u8>> {
+        self.ota_read(&protocol::nvds_read_payload(id))
+    }
+
+    /// Read the 4-byte ATB value for a GPIO.
+    pub fn atb(&mut self, gpio: u8) -> Result<u32> {
+        let data = self.ota_read(&protocol::atb_payload(gpio))?;
+        if data.len() < 4 {
+            return Err(Error::Protocol(format!(
+                "ATB reply is {} bytes, need at least 4",
+                data.len()
+            )));
+        }
+        Ok(u32::from_le_bytes([data[0], data[1], data[2], data[3]]))
+    }
+
+    /// Echo bytes through the OTA echo command.
+    pub fn echo(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        self.ota_read(&protocol::echo_payload(data))
+    }
+
+    /// Read LPC data.
+    pub fn lpc(&mut self) -> Result<Lpc> {
+        let frame = self.link_query(&protocol::link_payload(0x04, &[]))?;
+        let data = frame.link_data()?;
+        if data.len() < 9 {
+            return Err(Error::Protocol(format!(
+                "LPC reply is {} bytes, need at least 9",
+                data.len()
+            )));
+        }
+        let mut plc = [0u8; 8];
+        plc.copy_from_slice(&data[1..9]);
+        Ok(Lpc {
+            count: data[0],
+            plc,
+        })
+    }
+
+    /// Read link quality.
+    pub fn quality(&mut self) -> Result<Quality> {
+        let frame = self.link_query(&protocol::link_payload(0x03, &[]))?;
+        let data = frame.link_data()?;
+        if data.len() < 5 {
+            return Err(Error::Protocol(format!(
+                "quality reply is {} bytes, need at least 5",
+                data.len()
+            )));
+        }
+        Ok(Quality {
+            conn_handle: u16::from_le_bytes([data[0], data[1]]),
+            count: data[2],
+            rssi: data[3] as i8,
+            quality: data[4],
+        })
+    }
+
+    /// Read DEVM data.
+    pub fn devm(&mut self) -> Result<Devm> {
+        let frame = self.link_query(&protocol::link_payload(0x05, &[]))?;
+        let data = frame.link_data()?;
+        if data.len() < 83 {
+            return Err(Error::Protocol(format!(
+                "DEVM reply is {} bytes, need at least 83",
+                data.len()
+            )));
+        }
+        let mut devm = [0u8; 80];
+        devm.copy_from_slice(&data[3..83]);
+        Ok(Devm {
+            conn_handle: u16::from_le_bytes([data[0], data[1]]),
+            count: data[2],
+            devm,
+        })
+    }
+
+    /// Read the AFH map.
+    pub fn afh_map(&mut self) -> Result<AfhMap> {
+        let frame = self.link_query(&protocol::link_payload(0x02, &[]))?;
+        let data = frame.link_data()?;
+        if data.len() < 12 {
+            return Err(Error::Protocol(format!(
+                "AFH map reply is {} bytes, need at least 12",
+                data.len()
+            )));
+        }
+        let mut channels = [0u8; 10];
+        channels.copy_from_slice(&data[2..12]);
+        Ok(AfhMap {
+            conn_handle: u16::from_le_bytes([data[0], data[1]]),
+            channels,
+        })
+    }
+
+    /// Send one raw OTA command and return its status/data/frame.
+    pub fn raw_ota(&mut self, command_id: u8, args: &[u8]) -> Result<RawOtaReply> {
+        let payload = protocol::ota_payload(command_id, args);
+        protocol::encode_pa_request(CATEGORY_OTA, 0, &payload)?;
+        self.with_bridge(|driver| {
+            let frame = driver.ota_raw_query(&payload)?;
+            let status = frame.ota_status()?;
+            let data = frame.ota_data_raw()?.to_vec();
+            Ok(RawOtaReply {
+                status,
+                data,
+                frame: frame.to_bytes(),
+            })
+        })
+    }
+
+    /// Send one raw link command and return its event data/frame.
+    pub fn raw_link(&mut self, command_id: u8, args: &[u8]) -> Result<RawLinkReply> {
+        let payload = protocol::link_payload(command_id, args);
+        protocol::encode_pa_request(CATEGORY_LINK, 0, &payload)?;
+        self.with_bridge(|driver| {
+            let seq = driver.next_seq();
+            driver.send_request(CATEGORY_LINK, seq, &payload)?;
+            let frame = driver.wait_for_frame(CATEGORY_LINK)?;
+            Ok(RawLinkReply {
+                data: frame.link_data()?.to_vec(),
+                frame: frame.to_bytes(),
+            })
+        })
+    }
+
+    /// Send one raw PA request and return the first complete PI frame.
+    pub fn raw_pa(&mut self, category: u8, payload: &[u8]) -> Result<RawPaReply> {
+        protocol::encode_pa_request(category, 0, payload)?;
+        self.with_bridge(|driver| {
+            let seq = driver.next_seq();
+            driver.send_request(category, seq, payload)?;
+            let frame = driver.wait_for_any_frame()?;
+            let status = if protocol::is_ota_reply(&frame) {
+                Some(frame.ota_status()?)
+            } else {
+                None
+            };
+            let data = if protocol::is_ota_reply(&frame) {
+                frame.ota_data_raw()?.to_vec()
+            } else if frame.category == CATEGORY_LINK {
+                frame.link_data()?.to_vec()
+            } else {
+                frame.payload.clone()
+            };
+            Ok(RawPaReply {
+                category: frame.category,
+                seq: frame.seq,
+                status,
+                data,
+                frame: frame.to_bytes(),
+            })
+        })
+    }
+
+    /// Run one OTA read inside a bootloader session.
+    fn ota_read(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        self.with_bridge(|driver| driver.ota_query(payload))
     }
 
     /// Read `len` bytes starting at `addr`.
@@ -451,37 +746,8 @@ impl G435 {
 
     fn send_link_raw(&mut self, payload: &[u8]) -> Result<()> {
         let seq = self.next_seq();
-        self.bridge_link_ack = None;
         self.send_request(CATEGORY_LINK, seq, payload)?;
-
-        let deadline = Instant::now() + self.reply_timeout;
-        let mut frames = 0usize;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(Error::Timeout(
-                    "waiting for link event after setter request".to_string(),
-                ));
-            }
-
-            self.drain_input()?;
-            if let Some(frame) = self.poll_frame()? {
-                frames += 1;
-                if frames > MAX_FRAMES_PER_EXCHANGE {
-                    return Err(Error::Protocol(format!(
-                        "received more than {MAX_FRAMES_PER_EXCHANGE} frames waiting for setter event"
-                    )));
-                }
-                if frame.category == CATEGORY_LINK {
-                    frame.link_data()?;
-                    self.bridge_link_ack = None;
-                    return Ok(());
-                }
-            } else if self.bridge_link_ack.take().is_some() {
-                // Some setters answer with a bridge control ACK carrying an
-                // 0x0e payload but no PI event.
-                return Ok(());
-            }
-        }
+        self.drain_input()
     }
 
     fn link_query(&mut self, payload: &[u8]) -> Result<PaFrame> {
@@ -494,6 +760,61 @@ impl G435 {
         let frame = self.wait_for_frame(CATEGORY_LINK)?;
         frame.link_data()?;
         Ok(frame)
+    }
+
+    fn ota_raw_query(&mut self, payload: &[u8]) -> Result<PaFrame> {
+        let seq = self.next_seq();
+        self.send_request(CATEGORY_OTA, seq, payload)?;
+
+        let deadline = Instant::now() + self.reply_timeout;
+        let mut first_empty = None;
+        let mut frames = 0usize;
+        loop {
+            if Instant::now() >= deadline {
+                return first_empty
+                    .ok_or_else(|| Error::Timeout("waiting for raw OTA reply".to_string()));
+            }
+
+            self.drain_input()?;
+            if let Some(frame) = self.poll_frame()? {
+                frames += 1;
+                if frames > MAX_FRAMES_PER_EXCHANGE {
+                    return Err(Error::Protocol(format!(
+                        "received more than {MAX_FRAMES_PER_EXCHANGE} frames waiting for raw OTA reply"
+                    )));
+                }
+                if protocol::is_ota_reply(&frame) {
+                    let status = frame.ota_status()?;
+                    let data = frame.ota_data_raw()?;
+                    if status != 0 || !data.is_empty() {
+                        return Ok(frame);
+                    }
+                    if first_empty.is_none() {
+                        first_empty = Some(frame);
+                    }
+                }
+            }
+        }
+    }
+
+    fn wait_for_any_frame(&mut self) -> Result<PaFrame> {
+        let deadline = Instant::now() + self.reply_timeout;
+        let mut frames = 0usize;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout("waiting for PI reply".to_string()));
+            }
+            self.drain_input()?;
+            if let Some(frame) = self.poll_frame()? {
+                frames += 1;
+                if frames > MAX_FRAMES_PER_EXCHANGE {
+                    return Err(Error::Protocol(format!(
+                        "received more than {MAX_FRAMES_PER_EXCHANGE} frames waiting for PI reply"
+                    )));
+                }
+                return Ok(frame);
+            }
+        }
     }
 
     fn ota_query(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
@@ -676,9 +997,6 @@ impl G435 {
             // Bridge control/ACK frame, not a PI frame. It may be followed by
             // a complete PI frame in the same fragment; keep the PI suffix and
             // discard only the control prefix.
-            if fragment.get(8) == Some(&CATEGORY_LINK) {
-                self.bridge_link_ack = Some(fragment.to_vec());
-            }
             if let Some(offset) = fragment
                 .windows(2)
                 .position(|pair| pair == protocol::REPLY_MAGIC)

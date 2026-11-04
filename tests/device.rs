@@ -154,6 +154,12 @@ fn feature(frame: &[u8]) -> Vec<u8> {
     report
 }
 
+fn push_frame(mock: &Mock, frame: &[u8]) {
+    for chunk in frame.chunks(62) {
+        mock.push_feature(feature(chunk));
+    }
+}
+
 fn multi_feature(frames: &[Vec<u8>]) -> Vec<u8> {
     let mut payload = Vec::new();
     for frame in frames {
@@ -234,8 +240,7 @@ fn battery_enters_and_exits_the_bridge() {
 fn battery_mode_enforcement_and_ota_share_one_bridge() {
     let mock = Mock::new();
     mock.push_feature(feature(&link_reply(0, 0xe0, &[0])));
-    mock.push_feature(feature(&link_reply(1, 0xe1, &[0])));
-    mock.push_feature(feature(&link_reply(2, 0xe0, &[1])));
+    mock.push_feature(feature(&link_reply(1, 0xe0, &[1])));
     mock.push_feature(feature(&ota_reply(0x30, &[0x2c, 0x01])));
 
     let mut device = G435::with_transport(Box::new(mock.clone()));
@@ -578,47 +583,65 @@ fn link_mode_and_status_parse() {
 }
 
 #[test]
-fn setter_consumes_its_event_before_the_next_query() {
+fn set_mode_is_confirmed_by_get_mode() {
     let mock = Mock::new();
-    // SET_MODE event, then the GET_MODE reply. If the setter leaves its event
-    // queued, the query below reads the wrong byte and reports local.
-    mock.push_feature(feature(&link_reply(0, 0xe1, &[0x00])));
-    mock.push_feature(feature(&link_reply(1, 0xe0, &[1])));
-
-    let mut device = G435::with_transport(Box::new(mock.clone()));
-    device.set_mode(Mode::Remote).expect("set mode");
-    assert_eq!(device.mode().expect("mode"), Mode::Remote);
-}
-
-#[test]
-fn setter_accepts_a_bridge_control_ack_without_a_pi_event() {
-    let mock = Mock::new();
-    // SET_MODE is acknowledged by a 01 control frame carrying an 0x0e
-    // payload; the following GET_MODE uses a normal PI reply.
-    mock.push_feature(feature(&bridge_control(&[0x0e, 0x80, 0x00])));
     mock.push_feature(feature(&link_reply(0, 0xe0, &[1])));
 
     let mut device = G435::with_transport(Box::new(mock.clone()));
     device.set_mode(Mode::Remote).expect("set mode");
-    assert_eq!(device.mode().expect("mode"), Mode::Remote);
+
+    let writes = mock.writes();
+    assert_eq!(writes.len(), 4);
+    assert!(is_enter(&writes[0]));
+    assert_eq!(
+        writes[1],
+        encode_command_report(
+            &encode_pa_request(0x0e, 0, &protocol::link_payload(0xe1, &[1])).expect("set frame")
+        )
+        .expect("report")
+    );
+    assert_eq!(
+        writes[2],
+        encode_command_report(
+            &encode_pa_request(0x0e, 1, &protocol::link_payload(0xe0, &[])).expect("get frame")
+        )
+        .expect("report")
+    );
+    assert!(is_exit(&writes[3]));
+}
+
+#[test]
+fn inquiry_scan_and_connect_are_fire_and_forget() {
+    let mock = Mock::new();
+    let mut device = G435::with_transport(Box::new(mock.clone()));
+    device.set_inquiry_scan(true).expect("scan on");
+    device.set_inquiry_scan(false).expect("scan off");
+    device
+        .create_connect([1, 2, 3, 4, 5, 6])
+        .expect("create connect");
+
+    assert_eq!(mock.writes().len(), 9);
 }
 
 #[test]
 fn set_mode_and_scan_are_written_as_link_commands() {
     let mock = Mock::new();
-    mock.push_feature(feature(&link_reply(0, 0xe1, &[1])));
-    mock.push_feature(feature(&link_reply(1, 0xf0, &[1])));
-    mock.push_feature(feature(&link_reply(2, 0xf0, &[0])));
+    // SET_MODE confirmation reply; scans are fire-and-forget.
+    mock.push_feature(feature(&link_reply(0, 0xe0, &[1])));
     let mut device = G435::with_transport(Box::new(mock.clone()));
     device.set_mode(Mode::Remote).expect("set mode");
     device.set_inquiry_scan(true).expect("scan on");
     device.set_inquiry_scan(false).expect("scan off");
 
     let writes = mock.writes();
-    assert_eq!(writes.len(), 9);
-    for request_index in [1usize, 4, 7] {
-        assert!(is_enter(&writes[request_index - 1]));
-        assert!(is_exit(&writes[request_index + 1]));
+    assert_eq!(writes.len(), 10);
+    // SET_MODE and its GET_MODE confirmation share one bridge session.
+    assert!(is_enter(&writes[0]));
+    assert!(is_exit(&writes[3]));
+    // Each fire-and-forget scan has its own bridge session.
+    for (enter_index, exit_index) in [(4usize, 6usize), (7, 9)] {
+        assert!(is_enter(&writes[enter_index]));
+        assert!(is_exit(&writes[exit_index]));
     }
     assert_eq!(
         writes[1],
@@ -628,9 +651,16 @@ fn set_mode_and_scan_are_written_as_link_commands() {
         .expect("report")
     );
     assert_eq!(
-        writes[4],
+        writes[2],
         encode_command_report(
-            &encode_pa_request(0x0e, 1, &protocol::link_payload(0xf0, &[1])).expect("frame")
+            &encode_pa_request(0x0e, 1, &protocol::link_payload(0xe0, &[])).expect("frame")
+        )
+        .expect("report")
+    );
+    assert_eq!(
+        writes[5],
+        encode_command_report(
+            &encode_pa_request(0x0e, 2, &protocol::link_payload(0xf0, &[1])).expect("frame")
         )
         .expect("report")
     );
@@ -639,7 +669,6 @@ fn set_mode_and_scan_are_written_as_link_commands() {
 #[test]
 fn create_connect_sends_address_lsb_first() {
     let mock = Mock::new();
-    mock.push_feature(feature(&link_reply(0, 0xe5, &[0])));
     let mut device = G435::with_transport(Box::new(mock.clone()));
     device
         .create_connect([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
@@ -714,4 +743,213 @@ fn bridge_enter_timeout_attempts_an_exit() {
         writes.iter().any(|write| is_exit(write)),
         "an exit must be attempted after an enter timeout"
     );
+}
+
+#[test]
+fn fs_table_reads_140_bytes() {
+    let mock = Mock::new();
+    let data: Vec<u8> = (0..140u32).map(|value| (value * 3) as u8).collect();
+    push_frame(&mock, &ota_reply_category(CATEGORY_BRIDGE, 1, &data));
+
+    let mut device = G435::with_transport(Box::new(mock.clone()));
+    assert_eq!(device.fs_table().expect("fs-table"), data);
+
+    let writes = mock.writes();
+    assert_eq!(writes.len(), 3);
+    assert!(is_enter(&writes[0]));
+    assert!(is_exit(writes.last().expect("last write")));
+    assert_eq!(
+        writes[1],
+        encode_command_report(
+            &encode_pa_request(CATEGORY_OTA, 0, &protocol::fs_table_payload()).expect("frame")
+        )
+        .expect("report")
+    );
+}
+
+#[test]
+fn fs_index_decodes_offset_and_size() {
+    let mock = Mock::new();
+    let mut data = 0x1234u32.to_le_bytes().to_vec();
+    data.extend_from_slice(&0x5678u32.to_le_bytes());
+    mock.push_feature(feature(&ota_reply_category(CATEGORY_BRIDGE, 1, &data)));
+
+    let mut device = G435::with_transport(Box::new(mock.clone()));
+    let entry = device.fs_index(3).expect("fs-index");
+    assert_eq!(entry.offset, 0x1234);
+    assert_eq!(entry.size, 0x5678);
+}
+
+#[test]
+fn blob_reads_cust_mp_and_nvds() {
+    for (index, expected_id) in [("cust", 0x0fu8), ("mp", 0x01), ("nvds", 0x02)] {
+        let mock = Mock::new();
+        let data = vec![index.len() as u8, expected_id, 0xaa, 0xbb];
+        mock.push_feature(feature(&ota_reply_category(CATEGORY_BRIDGE, 1, &data)));
+
+        let mut device = G435::with_transport(Box::new(mock.clone()));
+        let reply = match index {
+            "cust" => device.cust_info(expected_id),
+            "mp" => device.mp_read(expected_id),
+            _ => device.nvds_read(expected_id),
+        }
+        .expect("blob read");
+        assert_eq!(reply, data);
+    }
+}
+
+#[test]
+fn atb_decodes_4_byte_value() {
+    let mock = Mock::new();
+    mock.push_feature(feature(&ota_reply_category(
+        CATEGORY_BRIDGE,
+        1,
+        &0x1234_5678u32.to_le_bytes(),
+    )));
+
+    let mut device = G435::with_transport(Box::new(mock.clone()));
+    assert_eq!(device.atb(0).expect("atb"), 0x1234_5678);
+}
+
+#[test]
+fn echo_returns_the_echoed_bytes() {
+    let mock = Mock::new();
+    let data = vec![0x00, 0x01, 0x02, 0x03];
+    mock.push_feature(feature(&ota_reply_category(CATEGORY_BRIDGE, 1, &data)));
+
+    let mut device = G435::with_transport(Box::new(mock.clone()));
+    assert_eq!(device.echo(&data).expect("echo"), data);
+}
+
+#[test]
+fn lpc_parses_count_and_plc() {
+    let mock = Mock::new();
+    let mut data = vec![3u8];
+    data.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    mock.push_feature(feature(&link_reply(0, 0x04, &data)));
+
+    let mut device = G435::with_transport(Box::new(mock.clone()));
+    let lpc = device.lpc().expect("lpc");
+    assert_eq!(lpc.count, 3);
+    assert_eq!(lpc.plc, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(mock.writes().len(), 3);
+}
+
+#[test]
+fn quality_parses_conn_handle_count_rssi_and_quality() {
+    let mock = Mock::new();
+    let data = vec![0x34, 0x12, 2, 0xc4, 77];
+    mock.push_feature(feature(&link_reply(0, 0x03, &data)));
+
+    let mut device = G435::with_transport(Box::new(mock.clone()));
+    let quality = device.quality().expect("quality");
+    assert_eq!(quality.conn_handle, 0x1234);
+    assert_eq!(quality.count, 2);
+    assert_eq!(quality.rssi, -60);
+    assert_eq!(quality.quality, 77);
+}
+
+#[test]
+fn devm_parses_conn_handle_count_and_80_bytes() {
+    let mock = Mock::new();
+    let mut data = vec![0x78, 0x56, 4];
+    data.extend((0..80u8).map(|value| value.wrapping_add(10)));
+    push_frame(&mock, &link_reply(0, 0x05, &data));
+
+    let mut device = G435::with_transport(Box::new(mock.clone()));
+    let devm = device.devm().expect("devm");
+    assert_eq!(devm.conn_handle, 0x5678);
+    assert_eq!(devm.count, 4);
+    assert_eq!(devm.devm[0], 10);
+    assert_eq!(devm.devm[79], 89);
+}
+
+#[test]
+fn afh_map_parses_conn_handle_and_10_channels() {
+    let mock = Mock::new();
+    let mut data = vec![0xbc, 0x9a];
+    data.extend(0..10u8);
+    mock.push_feature(feature(&link_reply(0, 0x02, &data)));
+
+    let mut device = G435::with_transport(Box::new(mock.clone()));
+    let afh = device.afh_map().expect("afh-map");
+    assert_eq!(afh.conn_handle, 0x9abc);
+    assert_eq!(afh.channels, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+}
+
+#[test]
+fn typed_link_queries_reject_short_replies() {
+    for (command, data) in [
+        (0x04u8, vec![0u8; 8]),
+        (0x03, vec![0u8; 4]),
+        (0x05, vec![0u8; 82]),
+        (0x02, vec![0u8; 11]),
+    ] {
+        let mock = Mock::new();
+        push_frame(&mock, &link_reply(0, command, &data));
+        let mut device = G435::with_transport(Box::new(mock.clone()));
+        let result = match command {
+            0x04 => device.lpc().map(|_| ()),
+            0x03 => device.quality().map(|_| ()),
+            0x05 => device.devm().map(|_| ()),
+            _ => device.afh_map().map(|_| ()),
+        };
+        assert!(
+            matches!(result, Err(Error::Protocol(_))),
+            "command {command:#04x} accepted a short reply"
+        );
+    }
+}
+
+#[test]
+fn raw_ota_returns_status_data_and_frame() {
+    let mock = Mock::new();
+    let reply = ota_reply_category(CATEGORY_BRIDGE, 0x55, &[0xaa, 0xbb]);
+    mock.push_feature(feature(&reply));
+
+    let mut device = G435::with_transport(Box::new(mock.clone()));
+    let result = device.raw_ota(0x38, &[]).expect("raw ota");
+    assert_eq!(result.status, 0);
+    assert_eq!(result.data, vec![0xaa, 0xbb]);
+    assert_eq!(result.frame, reply);
+    assert_eq!(mock.writes().len(), 3);
+}
+
+#[test]
+fn raw_ota_reports_nonzero_status() {
+    let mock = Mock::new();
+    let frame = pi_frame(CATEGORY_BRIDGE, 0x56, &[CATEGORY_OTA, 0x56, 0x07]);
+    mock.push_feature(feature(&frame));
+
+    let mut device = G435::with_transport(Box::new(mock.clone()));
+    let result = device.raw_ota(0x31, &[]).expect("raw ota");
+    assert_eq!(result.status, 7);
+    assert!(result.data.is_empty());
+}
+
+#[test]
+fn raw_link_returns_event_data_and_frame() {
+    let mock = Mock::new();
+    let reply = link_reply(0x55, 0xe0, &[1]);
+    mock.push_feature(feature(&reply));
+
+    let mut device = G435::with_transport(Box::new(mock.clone()));
+    let result = device.raw_link(0xe0, &[]).expect("raw link");
+    assert_eq!(result.data, vec![1]);
+    assert_eq!(result.frame, reply);
+}
+
+#[test]
+fn raw_pa_returns_first_pi_frame() {
+    let mock = Mock::new();
+    let reply = ota_reply_category(CATEGORY_BRIDGE, 0x55, &[0x2c, 0x01]);
+    mock.push_feature(feature(&reply));
+
+    let mut device = G435::with_transport(Box::new(mock.clone()));
+    let result = device.raw_pa(CATEGORY_OTA, &[0x00, 0x31]).expect("raw pa");
+    assert_eq!(result.category, CATEGORY_BRIDGE);
+    assert_eq!(result.seq, 0x55);
+    assert_eq!(result.status, Some(0));
+    assert_eq!(result.data, vec![0x2c, 0x01]);
+    assert_eq!(result.frame, reply);
 }

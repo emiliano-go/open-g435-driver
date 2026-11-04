@@ -16,7 +16,10 @@ pub mod error;
 pub mod protocol;
 pub mod transport;
 
-pub use device::{GrsStatus, ImageVersion, LinkStatus, Mode, Rssi, G435};
+pub use device::{
+    AfhMap, Devm, FsIndex, GrsStatus, ImageVersion, LinkStatus, Lpc, Mode, Quality, RawLinkReply,
+    RawOtaReply, RawPaReply, Rssi, G435,
+};
 pub use error::{Error, Result};
 
 /// Default vendor ID of the receiver.

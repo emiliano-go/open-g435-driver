@@ -140,3 +140,133 @@ fn requires_a_subcommand() {
     assert!(Cli::try_parse_from(["g435ctl"]).is_err());
     assert!(Cli::try_parse_from(["g435ctl", "read", "16"]).is_err());
 }
+
+#[test]
+fn parses_v3_typed_commands() {
+    let cli = Cli::try_parse_from(["g435ctl", "fs-table"]).expect("fs-table");
+    assert!(matches!(cli.command, Command::FsTable));
+
+    let cli = Cli::try_parse_from(["g435ctl", "fs-index", "0x0f"]).expect("fs-index");
+    match cli.command {
+        Command::FsIndex { index } => assert_eq!(index, 15),
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    for (name, id) in [("cust-info", 15u8), ("mp-read", 3), ("nvds-read", 4)] {
+        let cli = Cli::try_parse_from(["g435ctl", name, &id.to_string()]).expect(name);
+        match cli.command {
+            Command::CustInfo { id: got } if name == "cust-info" => assert_eq!(got, id),
+            Command::MpRead { id: got } if name == "mp-read" => assert_eq!(got, id),
+            Command::NvdsRead { id: got } if name == "nvds-read" => assert_eq!(got, id),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    let cli = Cli::try_parse_from(["g435ctl", "atb", "0"]).expect("atb");
+    match cli.command {
+        Command::Atb { gpio } => assert_eq!(gpio, 0),
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let cli = Cli::try_parse_from(["g435ctl", "echo", "0x00010203"]).expect("echo");
+    match cli.command {
+        Command::Echo { data } => assert_eq!(data.0, vec![0, 1, 2, 3]),
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    assert!(matches!(
+        Cli::try_parse_from(["g435ctl", "lpc"]).map(|cli| cli.command),
+        Ok(Command::Lpc)
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["g435ctl", "quality"]).map(|cli| cli.command),
+        Ok(Command::Quality)
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["g435ctl", "devm"]).map(|cli| cli.command),
+        Ok(Command::Devm)
+    ));
+    assert!(matches!(
+        Cli::try_parse_from(["g435ctl", "afh-map"]).map(|cli| cli.command),
+        Ok(Command::AfhMap)
+    ));
+}
+
+#[test]
+fn raw_commands_require_exact_unsafe_confirmation() {
+    for args in [
+        vec!["g435ctl", "raw-ota", "0x31"],
+        vec!["g435ctl", "raw-ota", "0x31", "--unsafe"],
+        vec!["g435ctl", "raw-ota", "0x31", "--confirm", "I-UNDERSTAND"],
+        vec!["g435ctl", "raw-ota", "0x31", "--unsafe", "--confirm", "yes"],
+        vec![
+            "g435ctl",
+            "raw-link",
+            "0xe0",
+            "--unsafe",
+            "--confirm",
+            "wrong",
+        ],
+        vec!["g435ctl", "raw-pa", "0x06", "0000", "--unsafe"],
+    ] {
+        assert!(
+            Cli::try_parse_from(args.clone()).is_err(),
+            "unexpected parse success for {args:?}"
+        );
+    }
+
+    let cli = Cli::try_parse_from([
+        "g435ctl",
+        "raw-ota",
+        "0x31",
+        "00",
+        "--unsafe",
+        "--confirm",
+        "I-UNDERSTAND",
+    ])
+    .expect("raw-ota parse");
+    match cli.command {
+        Command::RawOta {
+            command_id,
+            args,
+            unsafe_opts,
+        } => {
+            assert_eq!(command_id, 0x31);
+            assert_eq!(args, Some(open_g435::cli::HexBytes(vec![0])));
+            assert!(unsafe_opts.unsafe_flag);
+            assert_eq!(unsafe_opts.confirm, "I-UNDERSTAND");
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let cli = Cli::try_parse_from([
+        "g435ctl",
+        "raw-pa",
+        "0x06",
+        "0031",
+        "--unsafe",
+        "--confirm",
+        "I-UNDERSTAND",
+    ])
+    .expect("raw-pa parse");
+    match cli.command {
+        Command::RawPa {
+            category,
+            payload,
+            unsafe_opts,
+        } => {
+            assert_eq!(category, 6);
+            assert_eq!(payload.0, vec![0x00, 0x31]);
+            assert!(unsafe_opts.unsafe_flag);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_bad_v3_arguments() {
+    assert!(Cli::try_parse_from(["g435ctl", "fs-index", "256"]).is_err());
+    assert!(Cli::try_parse_from(["g435ctl", "echo", "abc"]).is_err());
+    assert!(Cli::try_parse_from(["g435ctl", "echo", "zz"]).is_err());
+    assert!(Cli::try_parse_from(["g435ctl", "atb", "0x100"]).is_err());
+}

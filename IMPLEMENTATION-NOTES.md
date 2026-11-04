@@ -1,6 +1,6 @@
 # Implementation notes
 
-Clean-room implementation of `g435-host-protocol-v2.5`.
+Clean-room implementation of `g435-host-protocol-v3.2`.
 
 ## Files created
 
@@ -29,7 +29,7 @@ Clean-room implementation of `g435-host-protocol-v2.5`.
 - `.github/workflows/ci.yml`: format, clippy, and test on stable Rust.
 - `IMPLEMENTATION-NOTES.md`: this file.
 
-No existing source files were modified; `Cargo.toml`, `Cargo.lock`, `docs/PROTOCOL.md`,
+No existing source files were modified; `Cargo.toml`, `Cargo.lock`, `SPEC.md`,
 `LICENSE`, `.gitignore`, and `AGENT-BRIEF.md` are untouched.
 
 ## Commands run
@@ -46,7 +46,7 @@ cache small.
 | `CARGO_TARGET_DIR=~/.cache/g435-cleanroom-target CARGO_PROFILE_DEV_DEBUG=0 RUSTFLAGS="-D warnings" cargo clippy --offline --all-targets` | 0 |
 | `CARGO_TARGET_DIR=~/.cache/g435-cleanroom-target CARGO_PROFILE_DEV_DEBUG=0 cargo test --offline` | 0 |
 
-Test totals: 60 passing (9 CLI parsing, 8 CLI output, 25 device, 18
+Test totals: 77 passing (12 CLI parsing, 8 CLI output, 39 device, 18
 protocol); 0 failed.
 
 ## Design decisions and spec ambiguities
@@ -78,12 +78,12 @@ protocol); 0 failed.
 - **`CREATE_CONNECT_EX` profile byte.** The spec shows `<profile>` but does not
   give its value; `0x00` is used. The BD_ADDR is sent least-significant byte
   first as specified.
-- **Link setters consume their event.** `SET_MODE`, `BT_INQUIRY_SCAN`, and
-  `CREATE_CONNECT_EX` wait for a category `0x0e` PI event and consume it so it
-  cannot satisfy a later query. The device does not always emit a PI event;
-  it may answer with a `01` bridge-control ACK carrying an `0x0e` payload.
-  That control ACK is accepted as completion and remains unavailable to later
-  PI queries.
+- **Link setters (v3.1).** `BT_INQUIRY_SCAN` and `CREATE_CONNECT_EX` are
+  fire-and-forget: write the request, drain, return. `SET_MODE` is written and
+  then confirmed by reading `GET_MODE` in the same bridge session, up to five
+  confirmation retries with 100 ms between reads. `ensure_remote_locked`
+  continues to read `GET_MODE` before and after `SET_MODE`. No setter waits
+  for a setter event.
 - **Bounded waits.** Reply waits use 2 s and bootloader ACK waits use 1 s, with
   the existing frame and retry limits.
 - **`READ_MAX_LEN` acknowledgement.** After sending it, the driver waits up
@@ -119,36 +119,47 @@ protocol); 0 failed.
   resynchronized.
 - **Zero-length storage read.** Alignment is still validated; `len == 0` then
   returns an empty vector without device access.
-- **OTA write/erase/reboot/handover commands** are not implemented.
+- **v3.0 typed safe commands.** `fs-table`, `fs-index`, `cust-info`,
+  `mp-read`, `nvds-read`, `atb`, and `echo` use the OTA payloads from section
+  9. Replies are returned as raw hex with decoded fields where specified.
+- **Typed link queries (v3.2).** `lpc`, `quality`, `devm`, and `afh-map` use
+  link payloads `04`, `03`, `05`, and `02`. Replies are parsed as specified:
+  LPC count + 8 PLC bytes; quality handle/count/RSSI/quality; DEVM
+  handle/count + 80 bytes; AFH handle + 10 channel bytes. Short replies are
+  protocol errors. These queries return the link timeout if the receiver emits
+  no event; data is never synthesized.
+- **Raw tunnel.** `raw-ota`, `raw-link`, and `raw-pa` exist behind
+  `--unsafe --confirm I-UNDERSTAND`; absent or wrong confirmation is rejected
+  by clap before device access. Raw commands emit a stderr warning and do not
+  retry writes. The typed path remains read-only; the raw tunnel is the only
+  destructive path. No raw command was run live.
+- **OTA write/erase/reboot/handover commands** are not implemented as typed
+  commands.
 
 ## Live device results
 
 Receiver present: `046d:0acb` (Logitech G435 Wireless Gaming Headset).
 Short checks only; no storage read or dump was performed.
 
-Live checks after the v2.4 changes:
+Live checks after the v3.2 changes (SPEC v3.2 SHA-256 verified):
+`bc4eb4caef60f0b36c6737eeabf14f5a93a2a45942351ad1cee2906a656e4071`.
 
 | Command | Exact output | Exit |
 | --- | --- | ---: |
-| `g435ctl status` | `link status: 0x01 (bits 0b00000001)` | 0 |
-| `g435ctl mode` | `remote` | 0 |
-| `g435ctl battery` | `3825 mV` | 0 |
-| `g435ctl rssi` | `AP L/R: -66 / -66 dBm, PTP L/R: -128 / -128 dBm` | 0 |
-| `g435ctl info` | `image version: 020208011e01`, `grs status: 0x00 (bits 0b00000000)`, `battery: 3825 mV` | 0 |
-| `g435ctl --json info` | `{"battery":3816,"grs_status":0,"image_version":"020208011e01"}` | 0 |
-| `g435ctl read 0 48` | `sha256: 0c6b048bd814d2f6ecd25f365562257dd453afb9b40591f5af42f6fe9b9553f3` | 0 |
-| `g435ctl read 0 96` | `sha256: fda8055fd1b6803ef5069e7ce8aaf1ded463eac42915717a104c7d0833e1be59` | 0 |
-| `g435ctl read 0 512` | `sha256: aa401fc348b5fcc8c85ad8922839d364c171f8eba5e7427d534634b264f0e7a6` | 0 |
+| `lpc` | `error: timeout: waiting for category 0x0e reply` | 1 |
+| `quality` | `error: timeout: waiting for category 0x0e reply` | 1 |
+| `devm` | `error: timeout: waiting for category 0x0e reply` | 1 |
+| `afh-map` | `error: timeout: waiting for category 0x0e reply` | 1 |
+| `status` | `link status: 0x01 (bits 0b00000001)` | 0 |
+| `battery` | `4146 mV` | 0 |
+| `fs-table` | `filesystem table (140 bytes)` plus 140-byte hex | 0 |
+| `mp-read 1` | `mp-read[1]: 6 bytes`, `a45a14995840` | 0 |
+| `read 0 48` | `sha256: 0c6b048bd814d2f6ecd25f365562257dd453afb9b40591f5af42f6fe9b9553f3` | 0 |
 
-The 48-byte data starts `ff ff cf 25 57 49 58 50 ...`; the `f0 00 00 00`
-READ_MAX_LEN acknowledgement is no longer included. The 48/96/512 hashes match
-the previously known values, and the smaller hex is a prefix of the larger.
-`info` now succeeds with image version `020208011e01`; the `MC` signature
-removed the previous status `0xff`. After adding the 1 MiB bound, `read 0 48`
-was rechecked and returned the same known SHA-256
-`0c6b048bd814d2f6ecd25f365562257dd453afb9b40591f5af42f6fe9b9553f3`. No
-larger storage read and no dump was performed. The mode was left set to
-remote.
+The four typed link queries time out on this receiver, as anticipated by
+v3.2: it emits no matching link event. No data was synthesized. No raw command
+or destructive command was run. No 4 KiB or larger storage read and no dump was
+performed. The mode was left remote.
 
 ## Forbidden input
 

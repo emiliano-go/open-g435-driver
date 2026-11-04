@@ -8,8 +8,10 @@ use std::time::Duration;
 
 use clap::Parser;
 use open_g435::cli::{
-    format_battery, format_info, format_mode, format_mode_set, format_pair, format_read,
-    format_read_written, format_rssi, format_scan, format_status, Cli, Command,
+    format_afh_map, format_atb, format_battery, format_blob, format_devm, format_echo,
+    format_fs_index, format_fs_table, format_info, format_lpc, format_mode, format_mode_set,
+    format_pair, format_quality, format_raw, format_read, format_read_written, format_rssi,
+    format_scan, format_status, Cli, Command,
 };
 use open_g435::{Error, G435};
 use tracing_subscriber::EnvFilter;
@@ -91,6 +93,114 @@ fn run(cli: Cli) -> Result<(), Error> {
             let grs = device.grs_status()?;
             let battery = device.battery()?;
             println!("{}", format_info(&image, &grs, battery, json));
+        }
+
+        Command::FsTable => {
+            let data = device.fs_table()?;
+            println!("{}", format_fs_table(&data, json));
+        }
+
+        Command::FsIndex { index } => {
+            let entry = device.fs_index(index)?;
+            let mut data = entry.offset.to_le_bytes().to_vec();
+            data.extend_from_slice(&entry.size.to_le_bytes());
+            println!("{}", format_fs_index(entry.offset, entry.size, &data, json));
+        }
+
+        Command::CustInfo { id } => {
+            let data = device.cust_info(id)?;
+            println!("{}", format_blob("cust-info", id, &data, json));
+        }
+
+        Command::MpRead { id } => {
+            let data = device.mp_read(id)?;
+            println!("{}", format_blob("mp-read", id, &data, json));
+        }
+
+        Command::NvdsRead { id } => {
+            let data = device.nvds_read(id)?;
+            println!("{}", format_blob("nvds-read", id, &data, json));
+        }
+
+        Command::Atb { gpio } => {
+            let value = device.atb(gpio)?;
+            println!("{}", format_atb(gpio, value, json));
+        }
+
+        Command::Echo { data } => {
+            let reply = device.echo(&data.0)?;
+            println!("{}", format_echo(&reply, json));
+        }
+
+        Command::Lpc => {
+            let lpc = device.lpc()?;
+            println!("{}", format_lpc(&lpc, json));
+        }
+
+        Command::Quality => {
+            let quality = device.quality()?;
+            println!("{}", format_quality(&quality, json));
+        }
+
+        Command::Devm => {
+            let devm = device.devm()?;
+            println!("{}", format_devm(&devm, json));
+        }
+
+        Command::AfhMap => {
+            let afh = device.afh_map()?;
+            println!("{}", format_afh_map(&afh, json));
+        }
+
+        Command::RawOta {
+            command_id,
+            args,
+            unsafe_opts: _,
+        } => {
+            eprintln!("warning: unsafe raw OTA command; no safety checks applied");
+            let reply = device.raw_ota(
+                command_id,
+                args.as_ref().map(|args| args.0.as_slice()).unwrap_or(&[]),
+            )?;
+            println!(
+                "{}",
+                format_raw(Some(reply.status), &reply.data, &reply.frame, None, json)
+            );
+        }
+
+        Command::RawLink {
+            command_id,
+            args,
+            unsafe_opts: _,
+        } => {
+            eprintln!("warning: unsafe raw link command; no safety checks applied");
+            let reply = device.raw_link(
+                command_id,
+                args.as_ref().map(|args| args.0.as_slice()).unwrap_or(&[]),
+            )?;
+            println!(
+                "{}",
+                format_raw(None, &reply.data, &reply.frame, None, json)
+            );
+        }
+
+        Command::RawPa {
+            category,
+            payload,
+            unsafe_opts: _,
+        } => {
+            eprintln!("warning: unsafe raw PA command; no safety checks applied");
+            let reply = device.raw_pa(category, &payload.0)?;
+            println!(
+                "{}",
+                format_raw(
+                    reply.status,
+                    &reply.data,
+                    &reply.frame,
+                    Some((reply.category, reply.seq)),
+                    json,
+                )
+            );
         }
 
         Command::Read { addr, len, output } => {

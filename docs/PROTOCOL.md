@@ -1,8 +1,8 @@
-# Logitech G435 host protocol, frozen specification v2.5
+# Logitech G435 host protocol, frozen specification v3.2
 
 Status: frozen for clean-room implementation.
 Date: 2026-11-03
-Spec ID: `g435-host-protocol-v2.5`
+Spec ID: `g435-host-protocol-v3.2`
 
 Revision history:
 
@@ -26,6 +26,17 @@ Revision history:
   ACKs and waits for the feature-report acknowledgement.
 - v2.5: storage reads are bounded to the 1 MiB external flash. Reject lengths
   above 1 MiB and any address plus length beyond 1 MiB before device access.
+- v3.0: full command inventory, typed safe read-only commands, and a public
+  raw tunnel for every PA category. Destructive commands are reachable only
+  through the raw tunnel with explicit unsafe confirmation. No destructive
+  live test is required or performed on the only receiver.
+- v3.1: link setters are fire-and-forget. `SET_MODE` is confirmed by a
+  subsequent `GET_MODE`, not by waiting for a setter event.
+  `BT_INQUIRY_SCAN` and `CREATE_CONNECT_EX` return after the write and drain.
+  Live testing showed the receiver may not emit a link event for a setter.
+- v3.2: exact link-query payloads and reply layouts for LPC, quality, DEVM,
+  and AFH map. These commands may time out on a receiver that does not emit
+  the link event; the typed command must report the timeout, not guess.
 
 This document is the only functional specification for the clean-room host
 driver. It contains observed protocol facts, not vendor source. It is written
@@ -200,8 +211,9 @@ n = buf[63]
 
 ## 8. Reply ordering
 
-- A link command may receive a bootloader ACK or an unrelated frame before the
-  category `0x0e` event.
+- A link query may receive a bootloader ACK or an unrelated frame before the
+  category `0x0e` event. A link setter may emit no event at all; do not block
+  waiting for one.
 - An OTA read may receive an ACK frame before the data frame. The ACK payload
   is `06 <seq> <status>` with no data.
 - OTA data filters must ignore empty OTA data payloads and wait for a non-empty
@@ -212,40 +224,67 @@ n = buf[63]
 
 ## 9. OTA commands (category 0x06)
 
-| ID | Name | Notes |
-| ---: | --- | --- |
-| `0x23` | STORAGE_READ | `00 23 01 <addr LE32> <len LE32>` |
-| `0x24` | MORE_FRAME | fetch the next data frame |
-| `0x25` | IOCTL | `READ_MAX_LEN` uses this |
-| `0x31` | GET_BATTERY | reply data is LE16 millivolts |
-| `0x32` | GET_RSSI | four signed bytes: L/R AP, L/R PTP |
-| `0x33` | GET_GRS_STATUS | one status byte |
-| `0x34` | GET_IMAGE_VERSION | `00 34 <op> <sig0> <sig1>`; raw data reply |
+Full observed command inventory. `R` means read-only or non-destructive.
+`D` means destructive or state-changing.
 
-`GET_IMAGE_VERSION` request payload is `00 34 00 4d 43` (length byte 4):
-opcode `0`, signature `MC` (`4d 43`). The signature selects the MCU code
-image. A `00 00` signature returns a device status error on this receiver.
+| ID | Name | Class | Notes |
+| ---: | --- | --- | --- |
+| `0x22` | STORAGE_WRITE | D | flash write |
+| `0x23` | STORAGE_READ | R | `00 23 01 <addr LE32> <len LE32>` |
+| `0x24` | MORE_FRAME | R | fetch next storage data frame |
+| `0x25` | IOCTL | D | sub-operation in arguments |
+| `0x30` | OTA_MODE | D | enter or leave OTA mode |
+| `0x31` | GET_BATTERY | R | LE16 millivolts |
+| `0x32` | GET_RSSI | R | four signed bytes |
+| `0x33` | GET_GRS_STATUS | R | status byte |
+| `0x34` | GET_IMAGE_VERSION | R | `00 34 00 4d 43` |
+| `0x35` | ERASE_LOAD_REGION | D | erase |
+| `0x36` | SET_LOAD_INFO | D | load metadata |
+| `0x37` | LOAD_MORE | D | load data |
+| `0x38` | CALC_LOAD_REGION_CRC | R | calculate CRC |
+| `0x39` | UPDATE | D | commit update |
+| `0x3A` | HANDOVER | D | handover |
+| `0x3B` | GET_FILESYSTEM_TABLE | R | 140-byte filesystem table |
+| `0x3C` | REBOOT | D | reboot |
+| `0x3D` | CALC_LOAD_REGION_CRC32 | R | calculate CRC32 |
+| `0x40` | READ_CUST_INFO | R | `00 40 <id>` |
+| `0x42` | REBOOT_AND_POWERON | D | reboot and power on |
+| `0x43` | READ_MP_DATA_BY_ID | R | `00 43 <id>` |
+| `0x44` | WRITE_MP_DATA_BY_ID | D | `00 44 <id> <data>` |
+| `0x45` | GET_ATB_VALUE | R | `00 45 <gpio>` |
+| `0x46` | READ_NVDS_DATA_BY_ID | R | `00 46 <id>` |
+| `0x48` | ENABLE_ADVERTISING | D | advertising control |
+| `0x49` | GET_FILESYSTEM_INDEX | R | `00 49 <index>` |
+| `0x60` | SET_BLE | D | BLE control |
+| `0x61` | TEST_MODE | D | test mode |
+| `0x62` | SET_LED | D | LED control |
+| `0x63` | GET_IO_LEVEL | R | read GPIO |
+| `0x64` | SET_LED_CURRENT | D | LED current |
+| `0x65` | SET_LED_PWM | D | LED PWM |
+| `0x66` | SET_IO_LEVEL | D | write GPIO |
+| `0x67` | WRITE_I2C | D | I2C write |
+| `0x68` | READ_I2C | R | I2C read |
+| `0x70` | SIDETONE_ENABLE | D | sidetone |
+| `0x71` | SET_SIDETONE_GAIN | D | sidetone gain |
+| `0x72` | GET_SIDETONE_GAIN | R | sidetone gain |
+| `0x7F` | SET_OTA_STATUS | D | OTA status |
+| `0xFE` | ECHO | R | `00 FE <data...>` |
 
-`READ_MAX_LEN(240)` request payload:
+Safe typed payloads:
 
-```
-00 25 34 12 5a 5a 01 00 00 00 f0 00 00 00
-```
+- `GET_FILESYSTEM_TABLE`: `00 3B`, length 1. Reply is 140 bytes.
+- `GET_FILESYSTEM_INDEX`: `00 49 <index>`, length 2. Reply is 8 bytes:
+  offset LE32, size LE32.
+- `READ_CUST_INFO`: `00 40 <id>`, length 2.
+- `READ_MP_DATA_BY_ID`: `00 43 <id>`, length 2.
+- `READ_NVDS_DATA_BY_ID`: `00 46 <id>`, length 2.
+- `GET_ATB_VALUE`: `00 45 <gpio>`, length 2. Reply is 4 bytes.
+- `ECHO`: `00 FE <data...>`, length `1 + data.len()`.
 
-Length byte is `0x0d`. Send it once per storage-read session.
-
-`STORAGE_READ` request payload:
-
-```
-00 23 01 <addr LE32> <len LE32>
-```
-
-Length byte is `0x0a`. `addr` and `len` must be multiples of four.
-
-`MORE_FRAME` request payload is `00 24`, length byte 1.
-
-Destructive OTA IDs (`0x22`, `0x30`, `0x35` through `0x3d`, `0x40`, `0x42`
-through `0x49`) are out of scope.
+The raw tunnel can send any OTA command ID with arbitrary arguments. It
+returns the OTA status and data bytes. It is dangerous and must require an
+explicit unsafe confirmation flag. It must not be the default path for typed
+safe commands.
 
 ## 10. Storage read algorithm
 
@@ -290,6 +329,19 @@ one chunk.
 least-significant byte first. `mode != 0` uses the current link and carries no
 address.
 
+Link-query payloads and reply layouts:
+
+- `GET_AFH_MAP`: payload `02`; reply `conn_handle LE16` followed by 10
+  channel bytes.
+- `GET_QUALITY`: payload `03`; reply `conn_handle LE16`, `count u8`,
+  `rssi i8`, `quality u8`.
+- `GET_LPC`: payload `04`; reply `count u8` followed by 8 PLC bytes.
+- `GET_DEVM`: payload `05`; reply `conn_handle LE16`, `count u8`, then 80
+  DEVM bytes.
+
+These are link category `0x0e` requests. A receiver that does not emit the
+link event must produce a timeout error; do not synthesize data.
+
 Before an OTA read of battery, RSSI, GRS, or image version, ensure the receiver
 is in remote mode:
 
@@ -298,6 +350,10 @@ is in remote mode:
 3. Otherwise send `SET_MODE(1)`, wait 100 ms, and read `GET_MODE` again.
 4. Retry at most five times. If the mode does not become remote, return an
    error instead of sending the OTA read.
+
+`SET_MODE` is written and then confirmed by reading `GET_MODE` again. Do not
+wait for a setter event. `BT_INQUIRY_SCAN` and `CREATE_CONNECT_EX` are
+fire-and-forget after the write and drain.
 
 The remote-mode check and the following OTA read must run inside one
 bootloader session. Do not exit the bridge between the last mode check and the
@@ -360,6 +416,43 @@ Global option: `--json`.
 - With `--output`, write raw bytes and do not print the hex.
 - Errors go to stderr and exit non-zero.
 - Logging goes to stderr; default level `warn`.
+
+### Raw and unsafe commands
+
+The public CLI must provide a raw tunnel for every PA command:
+
+- `g435ctl raw-ota <command-id> [args-hex]`
+- `g435ctl raw-link <command-id> [args-hex]`
+- `g435ctl raw-pa <category> <payload-hex>`
+
+Each raw command must require:
+
+```
+--unsafe --confirm I-UNDERSTAND
+```
+
+The token is exactly `I-UNDERSTAND`. Raw commands must print a warning to
+stderr. They must return the status byte, the raw reply data as hex, and
+the raw frame bytes. They must not silently retry a write.
+
+Typed safe commands must exist for:
+
+```
+g435ctl fs-table
+g435ctl fs-index <index>
+g435ctl cust-info <id>
+g435ctl mp-read <id>
+g435ctl nvds-read <id>
+g435ctl atb <gpio>
+g435ctl echo <hex>
+g435ctl lpc
+g435ctl quality
+g435ctl devm
+g435ctl afh-map
+```
+
+The typed safe commands must be usable without unsafe flags. They must not
+send write, erase, update, reboot, or handover commands.
 
 ## 14. Hardening requirements
 

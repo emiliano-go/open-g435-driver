@@ -203,6 +203,41 @@ pub fn get_image_version_payload() -> Vec<u8> {
     ota_payload(0x34, &[0x00, 0x4d, 0x43])
 }
 
+/// `GET_FILESYSTEM_TABLE` OTA payload.
+pub fn fs_table_payload() -> Vec<u8> {
+    ota_payload(0x3b, &[])
+}
+
+/// `GET_FILESYSTEM_INDEX` OTA payload.
+pub fn fs_index_payload(index: u8) -> Vec<u8> {
+    ota_payload(0x49, &[index])
+}
+
+/// `READ_CUST_INFO` OTA payload.
+pub fn cust_info_payload(id: u8) -> Vec<u8> {
+    ota_payload(0x40, &[id])
+}
+
+/// `READ_MP_DATA_BY_ID` OTA payload.
+pub fn mp_read_payload(id: u8) -> Vec<u8> {
+    ota_payload(0x43, &[id])
+}
+
+/// `READ_NVDS_DATA_BY_ID` OTA payload.
+pub fn nvds_read_payload(id: u8) -> Vec<u8> {
+    ota_payload(0x46, &[id])
+}
+
+/// `GET_ATB_VALUE` OTA payload.
+pub fn atb_payload(gpio: u8) -> Vec<u8> {
+    ota_payload(0x45, &[gpio])
+}
+
+/// `ECHO` OTA payload.
+pub fn echo_payload(data: &[u8]) -> Vec<u8> {
+    ota_payload(0xfe, data)
+}
+
 /// `READ_MAX_LEN(240)` OTA payload.
 pub fn read_max_len_payload() -> Vec<u8> {
     ota_payload(
@@ -300,6 +335,18 @@ impl PaFrame {
     /// Total length of the frame on the wire, including header and payload.
     pub fn total_len(&self) -> usize {
         10 + self.payload.len()
+    }
+
+    /// Rebuild the exact PI frame bytes (without any report padding).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(self.total_len());
+        frame.extend_from_slice(&REPLY_MAGIC);
+        frame.push(self.category);
+        frame.push(self.seq);
+        frame.extend_from_slice(&self.reserved);
+        frame.extend_from_slice(&(self.payload.len() as u16).to_le_bytes());
+        frame.extend_from_slice(&self.payload);
+        frame
     }
 
     /// OTA status byte.
