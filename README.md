@@ -21,7 +21,7 @@ analysis agent reviews and corrects defects.
 ```sh
 cargo build --release
 cargo test
-cargo clippy --all-targets -- -D warnings
+RUSTFLAGS="-D warnings" cargo clippy --all-targets
 cargo fmt --check
 ```
 
